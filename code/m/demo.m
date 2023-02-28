@@ -1,0 +1,214 @@
+clc;clear;
+close all;
+patchSize = 40;
+slideStep = 40;
+lambdaL = 0.7;
+
+img = imread("./images/1.bmp");
+figure,subplot(131)
+imshow(img),title('Original image')
+
+if ndims( img ) == 3
+    img = rgb2gray( img );
+end
+img = double(img);
+
+[imgHei, imgWid] = size(img);
+
+rowPatchNum = ceil((imgHei - patchSize) / slideStep) + 1;
+colPatchNum = ceil((imgWid - patchSize) / slideStep) + 1;
+rowPosArr = [1 : slideStep : (rowPatchNum - 1) * slideStep, imgHei - patchSize + 1];
+colPosArr = [1 : slideStep : (colPatchNum - 1) * slideStep, imgWid - patchSize + 1];
+
+[meshCols, meshRows] = meshgrid(colPosArr, rowPosArr);
+idx_fun = @(row,col) img(row : row + patchSize - 1, col : col + patchSize - 1);
+patchCell = arrayfun(idx_fun, meshRows, meshCols, 'UniformOutput', false);
+tenD = cat(3, patchCell{:});
+
+[n1,n2,n3] = size(tenD);  
+
+sz = 3;
+G = fspecial('gaussian', [sz sz], 2); % Gaussian kernel
+u = imfilter(img, G, 'symmetric');
+[Gx, Gy] = gradient(u);
+
+K = fspecial('gaussian', [sz sz], 9); % Gaussian kernel
+J_11 = imfilter(Gx.^2, K, 'symmetric'); 
+J_12 = imfilter(Gx.*Gy, K, 'symmetric');
+J_21 = J_12;
+J_22 = imfilter(Gy.^2, K, 'symmetric');   
+
+sqrt_delta = sqrt((J_11 - J_22).^2 + 4*J_12.^2);
+lambda1 = 0.5*(J_11 + J_22 + sqrt_delta);
+lambda2 = 0.5*(J_11 + J_22 - sqrt_delta);
+
+cornerStrength = (((lambda1.*lambda2)./(lambda1 + lambda2)));
+maxValue = (max(lambda1,lambda2));
+priorWeight = mat2gray(cornerStrength .* maxValue);
+
+[imgHei, imgWid] = size(priorWeight);
+
+rowPatchNum = ceil((imgHei - patchSize) / slideStep) + 1;
+colPatchNum = ceil((imgWid - patchSize) / slideStep) + 1;
+rowPosArr = [1 : slideStep : (rowPatchNum - 1) * slideStep, imgHei - patchSize + 1];
+colPosArr = [1 : slideStep : (colPatchNum - 1) * slideStep, imgWid - patchSize + 1];
+
+[meshCols, meshRows] = meshgrid(colPosArr, rowPosArr);
+idx_fun = @(row,col) priorWeight(row : row + patchSize - 1, col : col + patchSize - 1);
+patchCell = arrayfun(idx_fun, meshRows, meshCols, 'UniformOutput', false);
+tenW = cat(3, patchCell{:});
+
+lambda = lambdaL / sqrt(max(n1,n2)*n3); 
+
+% trpca_pstnn initail
+X = tenD;
+tol = 1e-3; 
+max_iter = 500;
+rho = 1.05;
+mu = 2*1e-3;
+max_mu = 1e10;
+DEBUG = 1;
+
+ratioN = 0.1;
+[~,~,n3] = size(X);
+D = Unfold(X,n3,1);
+[~, S, ~] = svd(D, 'econ');
+[desS, ~] = sort(diag(S), 'descend');
+ratioVec = desS / desS(1);
+idxArr = find(ratioVec < ratioN);
+if idxArr(1) > 1
+    N = idxArr(1) - 1;
+else
+    N = 1;
+end
+
+%trpca_pstnn
+dim = size(X);
+L = zeros(dim);
+S = zeros(dim);
+Y = zeros(dim);
+weightTen = ones(dim);
+
+for iter = 1 : max_iter
+    
+    preT = sum(S(:) > 0);
+    
+    % update L
+    R = -S+X-Y/mu;
+    L = prox_pstnn(R,N,mu);
+    
+    % update S
+    T = -L+X-Y/mu;
+    S = prox_l1(T, weightTen*lambda/mu);    
+    weightTen = N./ (abs(S) + 0.01)./tenW;
+  
+    dY = L+S-X;
+    err = norm(dY(:))/norm(X(:));
+    if DEBUG
+        if iter == 1 || mod(iter, 1) == 0            
+            disp(['iter ' num2str(iter) ', mu=' num2str(mu) ...
+                   ', err=' num2str(err)...
+                    ',|T|0 = ' num2str(sum(S(:) > 0))]); 
+        end
+    end
+    currT = sum(S(:) > 0);
+    if err < tol || (preT>0 && currT>0 && preT == currT)
+        break;
+    end 
+    Y = Y + dY*mu;
+    mu = min(rho*mu,max_mu);    
+end
+
+tenB = L;
+tenT = S;
+
+tarImg = res_patch_ten_mean(tenT, img, patchSize, slideStep);
+backImg = res_patch_ten_mean(tenB, img, patchSize, slideStep);
+
+maxv = max(max(double(img)));
+E = uint8( mat2gray(tarImg)*maxv );
+A = uint8( mat2gray(backImg)*maxv );
+subplot(132),imshow(E,[]),title('Target image')
+subplot(133),imshow(A,[]),title('Background image')
+
+function [X] = prox_pstnn(Y,N,mu)
+
+
+[n1,n2,n3] = size(Y);
+X = zeros(n1,n2,n3);
+Y = fft(Y,[],3);
+tau = 1/mu;
+
+
+% first frontal slice
+[U,S,V] = svd(Y(:,:,1),'econ');
+diagS = diag(S);
+[desS, sIdx] = sort(diagS, 'descend');
+[desU, desV] = deal(U(:, sIdx), V(:, sIdx));
+[U1, diagS1, V1] = deal(desU(:, 1:N), desS(1:N), desV(:, 1:N));
+[U2, diagS2, V2] = deal(desU(:, N+1:end), desS(N+1:end), desV(:, N+1:end));    
+threshS2 = max(diagS2-tau, 0);    
+X(:,:,1) = U1*diag(diagS1)*V1' + U2*diag(threshS2)*V2';
+
+
+% i=2,...,halfn3
+halfn3 = round(n3/2);
+for i = 2 : halfn3
+    [U,S,V] = svd(Y(:,:,i),'econ');
+    diagS = diag(S);
+    [desS, sIdx] = sort(diagS, 'descend');
+    [desU, desV] = deal(U(:, sIdx), V(:, sIdx));
+    [U1, diagS1, V1] = deal(desU(:, 1:N), desS(1:N), desV(:, 1:N));
+    [U2, diagS2, V2] = deal(desU(:, N+1:end), desS(N+1:end), desV(:, N+1:end));    
+    threshS2 = max(diagS2-tau, 0);    
+    X(:,:,i) = U1*diag(diagS1)*V1' + U2*diag(threshS2)*V2';
+    X(:,:,n3+2-i) = conj(X(:,:,i));
+end
+  
+% if n3 is even
+if mod(n3,2) == 0
+    i = halfn3+1;
+    [U,S,V] = svd(Y(:,:,i),'econ');
+    diagS = diag(S);
+    [desS, sIdx] = sort(diagS, 'descend');
+    [desU, desV] = deal(U(:, sIdx), V(:, sIdx));
+    [U1, diagS1, V1] = deal(desU(:, 1:N), desS(1:N), desV(:, 1:N));
+    [U2, diagS2, V2] = deal(desU(:, N+1:end), desS(N+1:end), desV(:, N+1:end));    
+    threshS2 = max(diagS2-tau, 0);    
+    X(:,:,i) = U1*diag(diagS1)*V1' + U2*diag(threshS2)*V2';
+end
+
+X = ifft(X,[],3);
+end
+
+function x = prox_l1(b,lambda)
+
+x = max(0,b-lambda)+min(0,b+lambda);
+x = max(x,0);
+end
+
+function recImg = res_patch_ten_mean(patchTen, img, patchSize, slideStep)
+
+[imgHei, imgWid] = size(img);
+
+rowPatchNum = ceil((imgHei - patchSize) / slideStep) + 1;
+colPatchNum = ceil((imgWid - patchSize) / slideStep) + 1;
+rowPosArr = [1 : slideStep : (rowPatchNum - 1) * slideStep, imgHei - patchSize + 1];
+colPosArr = [1 : slideStep : (colPatchNum - 1) * slideStep, imgWid - patchSize + 1];
+
+%% for-loop version
+accImg = zeros(imgHei, imgWid);
+weiImg = zeros(imgHei, imgWid);
+k = 0;
+onesMat = ones(patchSize, patchSize);
+for col = colPosArr
+    for row = rowPosArr
+        k = k + 1;
+        tmpPatch = reshape(patchTen(:, :, k), [patchSize, patchSize]);
+        accImg(row : row + patchSize - 1, col : col + patchSize - 1) = tmpPatch;
+        weiImg(row : row + patchSize - 1, col : col + patchSize - 1) = onesMat;
+    end
+end
+
+recImg = accImg ./ weiImg;
+end
